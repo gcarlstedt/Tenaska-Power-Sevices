@@ -1,0 +1,45 @@
+# Package Libraries
+
+rm(list=ls())
+
+library(RODBC)
+library(readxl)
+library(dplyr)
+library(lubridate)
+#---------------------------------------------------------------------------------------------------------------------------------------------
+#Read Access Data Base
+#Edit if file name is different 
+
+#Database
+DB <- "X:/Market Analysis/Departmental/AssetManagement/SPP/KPP/KPP Long term runs/Current KPP Long Term Runs/KPP_Long_Output_2022.mdb"
+
+#Connect to databas
+mbdConnect<-odbcConnectAccess2007(DB)
+
+#Read in necessary tables
+Units<-as_tibble(sqlFetch(mbdConnect,sqtable="Results_Units",stringsAsFactors=FALSE))
+Zones<-as_tibble(sqlFetch(mbdConnect,sqtable="Results_Zones",stringsAsFactors=FALSE))
+
+#Close database
+odbcCloseAll()
+#---------------------------------------------------------------------------------------------------------------------------------------------
+#Filter IDs for 
+
+#Lists to filter tables
+Units_ID <- c(5660, 6507, 6278, 17054, 17113, 83598)
+Zones_ID <- c(90001, 90002, 90003, 90005, 71521, 71651)
+
+#Assign new variable to filtered tibbles 
+#Tables should have 52560 rows (365*24*6)
+
+Units_Filter <- Units %>% filter(UnitId %in% Units_ID)
+Zones_Filter <- Zones %>% filter(ZoneId %in% Zones_ID)
+#---------------------------------------------------------------------------------------------------------------------------------------------
+#Read to CSV
+
+#Units_Filter tibble to csv
+write.csv(Units_Filter,"X:/Market Analysis/Departmental/AssetManagement/SPP/KPP/KPP Long term runs/Current KPP Long Term Runs/Units_Filter.csv",row.names = FALSE)
+
+#Zones_Filter tibble to csv
+write.csv(Zones_Filter,"X:/Market Analysis/Departmental/AssetManagement/SPP/KPP/KPP Long term runs/Current KPP Long Term Runs/Zones_Filter.csv",row.names = FALSE)
+
