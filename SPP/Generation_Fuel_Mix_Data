@@ -1,0 +1,294 @@
+# IPL/ Generation Fuel Mix Data Pull
+# Orginal Script Date: 12/09/2020
+# ---------------------------------------------------------------------------------
+## Downloading and Installing necessary packages ##
+
+install.packages("tidyverse")
+install.packages("RCurl")
+install.packages("lubridate")
+install.packages("plyr")
+install.packages("string")
+install.packages("dplyr")
+install.packages("zoo")
+install.packages("data.table")
+install.packages("readxl")
+install.packages("openxlsx")
+
+
+library(tidyverse)
+library(RCurl)
+library(lubridate)
+library(plyr)
+library(stringr)
+library(dplyr)
+library(zoo)
+library(data.table)
+library(readxl)
+library(openxlsx)
+# ---------------------------------------------------------------------------------
+##Pulling data from SPP website (historical Generation Fuel Mix Data, saved in CSV files)##
+
+#NOTE: This method is only viable for FTP websites 
+url = "ftp://pubftp.spp.org/Operational_Data/GEN_MIX/"
+url_files <- getURL(url, ftp.use.epsv = FALSE, dirlistonly = TRUE )
+url_files_split <- strsplit(url_files, "\r\n")
+filenames <- unlist(url_files_split)
+
+subset_filenames <- filenames[5:12] 
+
+scrape_csv <- function(x){
+  ###Function to read all CSVs to dataframe###
+  #URLs
+  urls <- paste0(url, x)
+  #read in file
+  df <- read_csv(as.character(urls))
+  return(df)
+}
+
+#Creating dataframe 
+gen_data_df <- subset_filenames %>% map_df(scrape_csv)
+# ---------------------------------------------------------------------------------
+##Initial cleaning up of the data##
+
+#checking to see if columns have NAs, and if so, how many
+colSums(is.na(gen_data_df)) #Quite a bit - Due to merging CSVs with different columns
+
+#combining Time Columnms and splitting off NA values (when combining result is "01/01/2013 NA" or "NA 01/02/2013")
+#Again due to differing formats and column titles in CSVs
+#Will produce string output aka character class 
+
+gen_data_df$DateTime <- apply(gen_data_df[,c("GMTTime","GMT MKT Interval")],1,
+                       function(i){paste(na.omit(i), collapse = " ")})
+
+#Checking this new Date column for any NAs, blank values, only whitespace etc. 
+sum(is.na(gen_data_df$DateTime)) #No NAs
+sum(gen_data_df$DateTime == '') #1 blank values
+sum(grepl("^\\s*$",gen_data_df$DateTime)) #1 cell with only whitespace --> Due to: function(i){paste(na.omit(i), collapse = " ")} 
+
+#Finding rows with unwanted DateTime
+which(grepl("^\\s*$",gen_data_df$DateTime)) #Row 105121
+which(gen_data_df$DateTime == '') #Row 105121
+
+gen_data_df <- gen_data_df[-c(105121),] #Excluding this row 
+
+#Checking to see if there are repeated values
+gen_data_df %>% distinct(DateTime)# Yes 5 rows (Look at size of tables)
+
+#See which rows are repeated 
+gen_data_df[duplicated(gen_data_df$DateTime),] #All in year 2015 (Jan. and Nov.), Paired repeated dates have exact same values
+
+#Deleting duplicates dates within 'Date' column
+#And creating new dataframe\
+date_no_dups <- gen_data_df[!duplicated(gen_data_df$DateTime),]
+
+#Coverting the 'DateTime' column to date format and then from UTC to CPT
+date_no_dups$DateTime <- ymd_hms(date_no_dups$DateTime)
+date_no_dups$DateTime <- with_tz(date_no_dups$DateTime,"America/Chicago")
+
+#Filtering 'Date' column for relevant analysis
+date_filter <- date_no_dups %>% 
+  filter(DateTime >= as.POSIXct("2014-03-01 00:00:00", tz="America/Chicago") & 
+           DateTime <= as.POSIXct("2020-12-02 00:00:00", tz="America/Chicago"))
+# ---------------------------------------------------------------------------------
+##Slicing dataframe to get revelevant columns - just want Date, Solar and Wind columns for this analysis##
+
+#Columns we want to keep and ordered appropiately
+keep_cols <- colnames(date_filter)[c(36,24,25,7,28,29,9)]
+
+#Slicing date_filter df with wanted columns and saving to new df variable
+renewable <- date_filter[,keep_cols]
+# ---------------------------------------------------------------------------------
+#Unaccounted data: 585 entries (710199 vs 710785)--> Going to fill NA for missing values
+#for missing date times
+
+full_dates <- seq(min(renewable$DateTime), max(renewable$DateTime), by = "5 min")
+
+full_dates <- data.frame(DateTime = full_dates) 
+
+complete_renewable <- merge(full_dates, renewable, by = "DateTime", all.x = TRUE)
+
+#Quick summary of data frame; see NA's etc.
+summary(complete_renewable)
+# ---------------------------------------------------------------------------------
+##Known unreported Data filling with 0's (NAs)##
+
+#Years 2014-2018 (Wind & Solar Market/Self columns)
+#Reporting for these metrics didn't start till 2018-01-01 06:00:00
+unreported_data1 <- colnames(complete_renewable)[c(2,3,5,6)]
+unreported_data1_start <- as.POSIXct("2014-03-01 00:00:00", tz="America/Chicago")
+unreported_data1_end <- as.POSIXct("2017-12-31 23:55:00", tz="America/Chicago") 
+#shifted to account for CPT conversion (-6 hrs) minus 5 minutes --> Looked at Excel sheet
+
+complete_renewable[unreported_data1][is.na(complete_renewable[unreported_data1]) & 
+                                   complete_renewable$DateTime >= unreported_data1_start & 
+                                   complete_renewable$DateTime <= unreported_data1_end] <-0
+
+#Years 2018-2020
+#Split Solar and Wind into Market/Self
+#Reporting for these metrics didn't start till 2018-01-01 06:00:00
+unreported_data2 <- colnames(complete_renewable)[c(4,7)]
+unreported_data2_start <- as.POSIXct("2018-01-01 00:00:00", tz="America/Chicago") #shifted to account for CPT conversion (-6 hrs)
+unreported_data2_end <- as.POSIXct("2020-12-02 00:00:00", tz="America/Chicago")
+
+complete_renewable[unreported_data2][is.na(complete_renewable[unreported_data2]) & 
+                        complete_renewable$DateTime >= unreported_data2_start & 
+                        complete_renewable$DateTime <= unreported_data2_end] <-0
+
+#Still unreported data --> NAs probably due to adding full date range plus unreported data for days 
+summary(complete_renewable)
+
+#Using Zoo package to perform interpolatin of values --> Simplicity (.12% of NA data makes up the complete data set)
+###Missing values (NAs) are replaced by linear interpolation via approx or cubic spline interpolation via spline, respectively###
+
+#Solar Components
+complete_renewable$`Solar Market` <- na.spline(complete_renewable$`Solar Market`)
+complete_renewable$`Solar Self` <- na.spline(complete_renewable$`Solar Self`)
+complete_renewable$`Solar` <- na.spline(complete_renewable$`Solar`)
+#Wind Components
+complete_renewable$`Wind Market` <- na.spline(complete_renewable$`Wind Market`)
+complete_renewable$`Wind Self` <- na.spline(complete_renewable$`Wind Self`)
+complete_renewable$`Wind` <- na.spline(complete_renewable$`Wind`)
+
+summary(complete_renewable) 
+#No more NA's, looking at other metrics as well, everything at first glance looks reasonable compared before splicing Summary
+#Now can start analysis and merging other data sets
+# ---------------------------------------------------------------------------------
+###Further subsetting and adding columns to dataframe###
+
+#Creating Actual Solar and Wind Column;
+#Add straight across, Shouldn't have to worry about corresponding values with dates
+#Solar/Wind will have values while Market+Self will just be zero and vice versa 
+complete_renewable$`Solar Total` <- complete_renewable$`Solar Market` + complete_renewable$`Solar Self` + complete_renewable$Solar
+complete_renewable$`Wind Total` <- complete_renewable$`Wind Market` + complete_renewable$`Wind Self` + complete_renewable$Wind
+
+#Breaking apart Date column for hourly conversion
+complete_renewable$DateTime2 <- droplevels(cut(complete_renewable$DateTime, breaks = "hour"))
+hourly_renewable <- aggregate(cbind(`Solar Market`, `Solar Self`, `Solar Total`, 
+                              `Wind Market`,`Wind Self`,`Wind Total`)~DateTime2,data = complete_renewable, FUN = mean)
+
+#Coverting back to recognized date format 
+hourly_renewable$DateTime2 <- as.POSIXct(hourly_renewable$DateTime2, tz="America/Chicago")
+
+#Helper columns to match Load and LMP data (Excel and CSV files) with correct date and HE 
+hourly_renewable$Date <- as.Date(format(hourly_renewable$DateTime2, "%Y/%m/%d"))
+hourly_renewable$Hour <- hour(hourly_renewable$DateTime2)
+hourly_renewable$HE <- ifelse(hourly_renewable$Hour == 0, hourly_renewable$Hour + 24, hourly_renewable$Hour)
+# ---------------------------------------------------------------------------------
+#Reading in SPP load for this time period --> excel file 
+file = "X:/Market Analysis/Departmental/Origination/SPP/IPL/Archive_SPP Gen Mix Data/Load Data_MarketPlace.xlsx"
+
+SPP_Load <- read_excel(file, sheet = "Load_Combined", range = cell_cols("C:E"), skip = 1)
+
+#Message: There were 16 warnings (use warnings(SPP_Load) to see them)
+#Coercing text to numeric 
+summary(SPP_Load) # Seem to be NA's for Load --> 16
+
+#Use Zoo package for simplicty, not very many NA's anyway, seems like there is also more Load data than our Hourly_Renewable df
+#Look at this later
+SPP_Load$`Load (MW)` <- na.spline(SPP_Load$`Load (MW)`)
+
+#Combining Renewable SPP data with SPP Load data
+#Return all rows from the left table, and any rows with matching keys from the right table
+#Could also you merge
+joined <- left_join(hourly_renewable, SPP_Load, by = c("Date" = "Date", "HE" = "HE"))
+
+#Seems there are duplicate dates in the SPP_Load data
+joined[duplicated(joined$`DateTime2`),] # 7
+
+#Going to average duplicate rows 
+#More on differences between data tables and data frames
+###https://stackoverflow.com/questions/18001120/what-is-the-practical-difference-between-data-frame-and-data-table-in-r###
+
+#Coverting to data table --> Look at above link for further information 
+
+#Getting all colomn names not Date, Hour, HE etc. 
+keys <- colnames(joined)[c(1,8,9,10)]
+
+#Coverting joined df to datatable dt
+joined_dt <- as.data.table(joined)
+
+#Averaging duplicate rows and assigning to load_data data table
+#.SD is specfic for data tables
+#Taking the mean for all columns, assumng duplicate, EXCEPT by designated column, GROUPING by desgined column
+#Hear we are computing the mean for all variables that don't exist in our key list
+#Values are the same for all other columns, aside for the Load data 
+load_data <- joined_dt[,lapply(.SD, mean), keys]
+
+#Slicing data table to keep only columns we want
+complete <- load_data[,c(2, 4:11)] 
+
+#Adding Renewable Peneration column to complete dt
+complete$`Renewable Penetration` <- (complete$`Solar Total` + complete$`Wind Total`)/complete$`Load`
+
+complete <- complete[-c(1),] #Excluding top row 
+
+#Final step to help with graphing. Turn this hourly data into monthly
+#Using average
+complete$yr_mon <- droplevels(cut(complete$Date, breaks = "month"))
+monthly_renewable <- aggregate(cbind(`Solar Market`, `Solar Self`, `Solar Total`, 
+                        `Wind Market`,`Wind Self`,`Wind Total`,
+                        `Load (MW)`, `Renewable Penetration`)~yr_mon,data = complete, mean)
+#Renaming "yr_mon" column to "Date"
+names(monthly_renewable)[1] <- 'Date' 
+# ---------------------------------------------------------------------------------
+#Reading in INDN DART LMP data for this time period --> excel file 
+#Repeat of how we read in the SPP load data
+
+file2 = "X:/Market Analysis/Departmental/Origination/SPP/IPL/Incomplete December 2020 IPL Data Pull/IPL Data Pull Plus CleanUp.xlsx"
+
+indn_dart <- read_excel(file2, sheet = "INDN_DART_LMPs", range = cell_cols("B:E"), skip = 1)
+
+summary(indn_dart) # No NA's, data looks good 
+
+#Assuming there will be duplicates with this data as well 
+indn_dart[duplicated(indn_dart$`Date`),] # 7
+
+#Getting all colomn names not pricing related --> so just Date and HE
+keys2 <- colnames(indn_dart)[1:2]
+
+#Coverting joined df to datatable dt
+indn_dt <- as.data.table(indn_dart)
+
+#Averaging duplicate rows and assigning to indn_data data table
+#Values are different for pricing
+indn_data <- indn_dt[,lapply(.SD, mean), keys2]
+# ---------------------------------------------------------------------------------
+#Creating volatility columns for DART pricing
+
+#creating helper column --> Turns date to only year and month
+indn_data$yr_mon <- floor_date(indn_data$Date, "month")
+
+#Creating volatility
+rt_vol <- ddply(indn_data, "yr_mon", summarise, `Real Time Volatility` = sd(`Real Time ($/MW)`)/mean(`Real Time ($/MW)`))
+da_vol <- ddply(indn_data, "yr_mon", summarise, `Day Ahead Volatility` = sd(`Day Ahead ($/MW)`)/mean(`Day Ahead ($/MW)`))
+
+#Merge data sets
+dart_vol <- merge(rt_vol, da_vol, by.x = "yr_mon", by.y = "yr_mon")
+
+#Renaming "yr_mon" column to "Date"
+names(dart_vol)[1] <- 'Date' 
+
+#Number of rows now matches our Renewable (complete) data table --> 52225
+#Not merging tables for organizational purposes 
+# ---------------------------------------------------------------------------------
+#Writing above data table to excel file
+
+#Blank workbook
+wb <- createWorkbook()
+
+# Add some sheets to the workbook
+addWorksheet(wb, "Graphs")
+addWorksheet(wb, "Renewable_Generation_Data")
+addWorksheet(wb, "INDN_DART_LMP")
+
+
+# Write the data to the sheets
+writeData(wb, sheet = "Renewable_Generation_Data", x = monthly_renewable)
+writeData(wb, sheet = "INDN_DART_LMP", x = dart_vol)
+
+# Export the file
+path = "X:/Market Analysis/Departmental/Origination/SPP/IPL/R Scripts/IPL Data Inquiry_2020030120201201.xlsx"
+
+saveWorkbook(wb, path, overwrite = TRUE)
+
+save.image('Renewable_Data.RData')
